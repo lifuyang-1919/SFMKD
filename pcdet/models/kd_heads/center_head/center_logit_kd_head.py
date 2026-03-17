@@ -111,6 +111,8 @@ class CenterLogitKDHead(KDHeadTemplate):
 
         tb_dict['kd_hm_ls'] = kd_hm_loss if isinstance(kd_hm_loss, float) else kd_hm_loss.item()
         tb_dict['kd_loc_ls'] = kd_reg_loss if isinstance(kd_reg_loss, float) else kd_reg_loss.item()
+        if batch_dict.get('pred_tea5') is not None:
+            tb_dict['temp5'] = batch_dict['temperature']
         return kd_logit_loss, tb_dict
 
     def get_kd_loss_with_raw_prediction(self, pred_tea, loss_cfg, target_dict_tea):

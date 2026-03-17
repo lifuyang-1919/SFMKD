@@ -5,78 +5,82 @@ from torch.nn.init import kaiming_normal_
 from pcdet.models.model_utils.basic_block_2d import build_block
 
 
-class KDAdaptBlock(nn.Module):
-    def __init__(self, model_cfg, point_cloud_range):
+class TeacherAlignLayer(nn.Module):
+    def __init__(self, in_channels, out_c1=256, out_c2=32):
         super().__init__()
-        self.model_cfg = model_cfg
-        self.point_cloud_range = point_cloud_range
-        self.align_module_list = []
- 
-        for adapt_layer_name, adapt_layer_cfg in self.model_cfg.MODULE.items():
-            self.add_module(adapt_layer_name.lower(), BasicAdaptLayer(adapt_layer_cfg))
-            self.align_module_list.append(getattr(self, adapt_layer_name.lower()))
+        self.out_c1=out_c1
+        self.out_c2 = out_c2
+        self.conv256 = nn.Sequential(
+            nn.Conv2d(in_channels, out_c1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c1),
+            nn.ReLU(inplace=True)
+        )
+        self.bn256 = nn.BatchNorm2d(out_c1)
+        self.conv32 = nn.Sequential(
+            nn.Conv2d(out_c1, out_c2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_c2),
+            nn.ReLU(inplace=True)
+        )
+        self.bn32 = nn.BatchNorm2d(out_c2)
+        self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, batch_dict):
-        if self.training:
-            for adapt_layer in self.align_module_list:
-                batch_dict = adapt_layer(batch_dict)
+        # self._init_weights()
+        self.channel_select_init(self.conv32)
+        self.channel_select_init(self.conv256)
 
-        return batch_dict
+    # def _init_weights(self):
+    #     nn.init.orthogonal_(self.conv256.weight)
+    #     nn.init.orthogonal_(self.conv32.weight)
+    def channel_select_init(self,conv):
+        with torch.no_grad():
+            conv.weight.zero_()
+            out_c, in_c, _, _ =conv.weight.shape
+            step = in_c /out_c
+            for i in range(out_c):
+                start = int(i*step)
+                end = int((i+1)*step)
+                k = max(end-start, 1)
+                conv.weight[i,start:end,0,0] = 1.0/k
+    def channel_dowmsample(self,x):
+        B,C,H,W = x.shape
+        step = C// self.out_c1
+        idx = torch.arange(0,C,step,device=x.device)[:self.out_c1]
+        return x[:,idx,:,:]
+    def forward(self, feat):
+        # residual256 = self.channel_dowmsample(feat)
+        feat256 = self.relu(self.bn256(self.conv256(feat)))
+        feat32 = self.relu(self.bn32(self.conv32(feat256)))
+        
+        return feat256, feat32
 
-
-class BasicAdaptLayer(nn.Module):
-    def __init__(self, block_cfg):
+class StudentAlignLayer(nn.Module):
+    def __init__(self, in_channel=256, out_channel=32):
         super().__init__()
-        self.block_cfg = block_cfg
-        self.in_feature_name = block_cfg.in_feature_name
-        self.out_feature_name = block_cfg.out_feature_name
+        self.conv32 = nn.Sequential(
+            nn.Conv2d(in_channel, out_channel, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU(inplace=True)
+        )
+        self.bn32 = nn.BatchNorm2d(out_channel)
+        self.relu = nn.ReLU(inplace=True)
 
-        self.build_adaptation_layer(block_cfg)
+        # self._init_weights()
+        self.channel_select_init(self.conv32)
 
-        self.init_weights(weight_init='xavier')
+    # def _init_weights(self):
+    #     nn.init.orthogonal_(self.conv32.weight)
+    def channel_select_init(self,conv):
+        with torch.no_grad():
+            conv.weight.zero_()
+            out_c, in_c, _, _ =conv.weight.shape
+            step = in_c /out_c
+            for i in range(out_c):
+                j = int(i*step)
+                conv.weight[i,j,0,0] = 1.0
 
-    def init_weights(self, weight_init='xavier'):
-        if weight_init == 'kaiming':
-            init_func = nn.init.kaiming_normal_
-        elif weight_init == 'xavier':
-            init_func = nn.init.xavier_normal_
-        elif weight_init == 'normal':
-            init_func = nn.init.normal_
-        else:
-            raise NotImplementedError
+    def forward(self, feat):
+        feat256 = feat
+        feat32 = self.relu(self.bn32(self.conv32(feat)))
+        
+        return feat256, feat32
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv1d):
-                if weight_init == 'normal':
-                    init_func(m.weight, mean=0, std=0.001)
-                else:
-                    init_func(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def build_adaptation_layer(self, block_cfg):
-        align_block = []
-
-        in_channel = block_cfg.in_channel
-        block_types = block_cfg.block_type
-        num_filters = block_cfg.num_filters
-        kernel_sizes = block_cfg.kernel_size
-        num_strides = block_cfg.strides
-        paddings = block_cfg.padding
-
-        for i in range(len(num_filters)):
-            align_block.extend(build_block(
-                    block_types[i], in_channel, num_filters[i], kernel_size=kernel_sizes[i],
-                    stride=num_strides[i], padding=paddings[i], bias=False
-                ))
-
-        self.adapt_layer = nn.Sequential(*align_block)
-
-    def forward(self, batch_dict):
-        in_feature = batch_dict[self.in_feature_name]
-
-        out_feature = self.adapt_layer(in_feature)
-
-        batch_dict[self.out_feature_name] = out_feature
-
-        return batch_dict

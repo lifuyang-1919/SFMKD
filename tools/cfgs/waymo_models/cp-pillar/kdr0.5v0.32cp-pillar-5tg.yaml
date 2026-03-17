@@ -593,6 +593,12 @@ KD:
 
         FEATURE_NAME: spatial_features_2d
         FEATURE_NAME_TEA: spatial_features_2d
+        
+        Channel_Align_Layer:
+            base_in_channels: 384
+            channel_scales: [ 1.0, 1.0, 1.0, 0.875, 0.75 ]  # → [512,512,512,448,384]
+            out_channel1: 192
+            out_channel2: 32
 
         # Align feature map
         ALIGN: {
@@ -619,7 +625,7 @@ KD:
             DOWNSAMPLE_RATIO: 1
 
             ROI: tea_5 # ['gt', 'tea', 'stu'， tea_5， tea_2， select]
-            THRESH: 0.5 # for teacher prediction for student prediction
+            THRESH: 0.7
             MAX_ROIS: 50
 
     LABEL_ASSIGN_KD:

@@ -60,7 +60,43 @@ class CenterHeadKD(CenterLogitKDHead, CenterFeatureKDHead, CenterRoIKDHead,
 
                 align_block.append(fc)
             dense_head.__setattr__('align_block', nn.Sequential(*align_block))
+            if self.model_cfg.get('FEATURE_KD', None) and self.model_cfg.FEATURE_KD.get('Channel_Align_Layer', None) and \
+                self.model_cfg.FEATURE_KD.ENABLED:
+                  self._register_channel_align_layer(dense_head)
+    def _register_channel_align_layer(self, dense_head): # two layers
+        """注册DualBranch对齐层"""
+        align_cfg = self.model_cfg.FEATURE_KD.Channel_Align_Layer
 
+        # 注册教师对齐层
+        from ...kd_adapt_block.kd_adapt_block import TeacherAlignLayer
+        teacher_align_layer = nn.ModuleList([
+            TeacherAlignLayer(
+                in_channels=int(align_cfg.base_in_channels * s),
+                out_c1=align_cfg.out_channel1,
+                out_c2=align_cfg.out_channel2
+            )
+            for s in align_cfg.channel_scales
+        ])
+        dense_head.__setattr__('teacher_align_layer', teacher_align_layer)
+        # 注册学生对齐层
+        from ...kd_adapt_block.kd_adapt_block import StudentAlignLayer
+        student_align_layer = StudentAlignLayer(
+            in_channel=align_cfg.out_channel1,
+            out_channel=align_cfg.out_channel2
+        )
+        dense_head.__setattr__('student_align_layer', student_align_layer)
+    def get_align_dummy_loss(self):
+        dummy = 0.0
+
+        if hasattr(self.dense_head, 'student_align_layer'):
+            for p in self.dense_head.student_align_layer.parameters():
+                dummy = dummy + p.sum() * 0.0
+
+        if hasattr(self.dense_head, 'teacher_align_layer'):
+            for p in self.dense_head.teacher_align_layer.parameters():
+                dummy = dummy + p.sum() * 0.0
+
+        return dummy
     def put_pred_to_ret_dict(self, dense_head, data_dict, pred_dicts):
         if data_dict.get('teacher_decoded_pred_flag', None) and dense_head.training:
             decoded_pred_dicts = dense_head.generate_predicted_boxes(
@@ -98,11 +134,24 @@ class CenterHeadKD(CenterLogitKDHead, CenterFeatureKDHead, CenterRoIKDHead,
             kd_logit_loss, tb_dict = self.get_logit_kd_loss(batch_dict, tb_dict)
             kd_loss += kd_logit_loss
 
-        if self.model_cfg.get('FEATURE_KD', None) and self.model_cfg.FEATURE_KD.ENABLED:
+        temperature = batch_dict.get('temperature', None)
+        # import pdb;pdb.set_trace()
+        if (
+                self.model_cfg.get('FEATURE_KD', None)
+                and self.model_cfg.FEATURE_KD.ENABLED
+                and temperature is not None
+                # and temperature > 0
+        ):
+
             kd_feature_loss, tb_dict = self.get_feature_kd_loss(
                 batch_dict, tb_dict, self.model_cfg.KD_LOSS.FEATURE_LOSS
             )
+            if abs(temperature - 200) < 1e-6:  # 温度接近200
+                kd_feature_loss = kd_feature_loss * 2.0
             kd_loss += kd_feature_loss
+        else:
+            # 防止 DDP / unused parameter 报错
+            kd_loss += self.get_align_dummy_loss()
 
         return kd_loss, tb_dict
 

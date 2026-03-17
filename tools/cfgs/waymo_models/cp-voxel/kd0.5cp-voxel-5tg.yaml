@@ -559,12 +559,12 @@ OPTIMIZATION:
     BATCH_SIZE_PER_GPU: 4
     NUM_EPOCHS: 150
 
-    OPTIMIZER: SegmentedOneCycle  #adam_onecycle  SegmentedOneCycle
+    OPTIMIZER: SegmentedOneCycle  #adam_onecycle
     LR: 0.003
     WEIGHT_DECAY: 0.01
     MOMENTUM: 0.9
     TTT: 50
-    T_range:  [200, 200] # [0.1, 10][1, 10]
+    T_range:  [200.0, 0.02, 0.0]
     Cycle_num: 1   # NUM_EPOCHS= cycle_num*TTT*3
     Cycle_decay: [1.0, 0.3, 0.3, 0.1]  # lr*Cycle_decay
 
@@ -616,6 +616,12 @@ KD:
 
         FEATURE_NAME: spatial_features_2d
         FEATURE_NAME_TEA: spatial_features_2d
+        
+        Channel_Align_Layer:
+            base_in_channels: 512
+            channel_scales: [ 1.0, 1.0, 1.0, 0.875, 0.75 ]  # → [512,512,512,448,384]
+            out_channel1: 256
+            out_channel2: 32
 
         # Align feature map
         ALIGN: {
@@ -642,7 +648,7 @@ KD:
             DOWNSAMPLE_RATIO: 1
 
             ROI: tea_5 # ['gt', 'tea', 'stu'， tea_5， tea_2， select]
-            THRESH: 0.7 # for teacher prediction for student prediction
+            THRESH: 0.7
             MAX_ROIS: 50
 
     LABEL_ASSIGN_KD:
@@ -667,8 +673,8 @@ KD_LOSS:
     TEA_ACCUR: [1.0, 0.875, 0.75, 0.625, 0.5]  # tea_accur weighting
     HM_LOSS: {
         type: MSELoss, # [FocalLossCenterNet, SmoothL1Loss, MSELoss]
-        weight: 15.0,
-        thresh: 0.0,  # threshold for score PP Logit KD
+        weight: 10.0,
+        thresh: 0.1,  # threshold for score PP Logit KD
         fg_mask: True,
         soft_mask: True,
         rank: -1,  # rank PP Logit KD, -1 means not used
@@ -685,7 +691,7 @@ KD_LOSS:
         mode: rois,
         tea_num: False,  #tea_2 tea_5
         type: MSELoss, # [SmoothL1Loss, MSELoss]
-        weight: 1,
+        weight: 0.1,
         GID: False,
         rel_weight: 0.1,
         GID_ANG: True,
@@ -698,14 +704,14 @@ KD_LOSS:
 PRUNING2D:
     ENABLED: True
     Random2D: False
-    retain_ratio: 1.0
+    retain_ratio: 0.5
 
 PRUNING3D:
     ENABLED: True
     mode: pillar  # voxel
     Random3D: False
-    retain_ratio: 0.25
-    retain_ratio3D: 0.25
+    retain_ratio: 0.5
+    retain_ratio3D: 0.5
 
 global_prune:
     ENABLED: False

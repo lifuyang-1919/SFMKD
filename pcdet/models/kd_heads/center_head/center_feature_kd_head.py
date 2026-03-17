@@ -151,7 +151,334 @@ class CenterFeatureKDHead(KDHeadTemplate):
 
         return kd_feature_loss
 
-        def get_feature_kd_loss_rois5(self, batch_dict, loss_cfg):
+    def get_feature_kd_loss_rois(self, batch_dict, loss_cfg):
+        feature_name = self.model_cfg.FEATURE_KD.FEATURE_NAME
+        feature_stu = batch_dict[feature_name]
+        feature_name_tea = self.model_cfg.FEATURE_KD.get('FEATURE_NAME_TEA', feature_name)
+        feature_tea = batch_dict[feature_name_tea + '_tea']
+
+        feat_height = feature_stu.shape[2]
+        feat_height_tea = feature_tea.shape[2]
+
+        bs = feature_stu.shape[0]  # batchsize
+        if self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'gt':
+            rois = batch_dict['gt_boxes'].detach()
+        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea':
+            rois = []
+            weis = []
+            for b_idx in range(bs):
+                cur_pred_tea = batch_dict['decoded_pred_tea'][b_idx]
+                pred_scores = cur_pred_tea['pred_scores']
+                score_mask = pred_scores > self.model_cfg.FEATURE_KD.ROI_POOL.THRESH
+                rois.append(cur_pred_tea['pred_boxes'][score_mask])
+                weis.append(pred_scores[score_mask])
+                # import pdb; pdb.set_trace()
+                # weis.append(pred_scores[score_mask] + 1 / (pred_scores[score_mask] + 10))
+            weis = torch.cat(weis)
+        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea_5':
+            rois = []
+            for b_idx in range(bs):
+                cur_pred_tea = batch_dict['decoded_pred_tea'][b_idx]
+
+                # Filter predictions by score threshold
+                score_mask = cur_pred_tea['pred_scores'] > self.model_cfg.FEATURE_KD.ROI_POOL.THRESH
+                all_scores = torch.tensor(cur_pred_tea['pred_scores'][score_mask], dtype=torch.float32)
+                all_boxes = torch.tensor(cur_pred_tea['pred_boxes'][score_mask], dtype=torch.float32)
+
+                if len(all_boxes) > 0:
+                    from ....ops.iou3d_nms import iou3d_nms_utils
+
+                    # Compute IoU matrix
+                    iou_matrix = iou3d_nms_utils.boxes_iou3d_gpu(all_boxes[:, :7], all_boxes[:, :7])
+                    nms_thresh = self.model_cfg.FEATURE_KD.ROI_POOL.get('NMS_THRESH', 0.1)
+
+                    # Sort boxes by score
+                    scores_sorted, indices = torch.sort(all_scores, descending=True)
+
+                    # NMS process
+                    keep_indices = []
+                    while indices.numel() > 0:
+                        keep_indices.append(indices[0])
+                        if indices.numel() == 1:
+                            break
+
+                        # Calculate IoU with other boxes
+                        cur_ious = iou_matrix[indices[0]][indices[1:]]
+
+                        # Keep boxes with low IoU
+                        mask = cur_ious < nms_thresh
+                        indices = indices[1:][mask]
+
+                    # Get final boxes
+                    keep_indices = torch.stack(keep_indices)
+                    nms_boxes = all_boxes[keep_indices]
+
+                    # Limit max ROIs
+                    max_rois = self.model_cfg.FEATURE_KD.ROI_POOL.get('MAX_ROIS', 100)
+                    nms_boxes = nms_boxes[:max_rois]
+
+                    rois.append(nms_boxes)
+                else:
+                    rois.append(torch.zeros((0, 7)).to(feature_stu_device))
+        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'stu':
+            rois = []
+            weis = []
+            for b_idx in range(bs):
+                cur_pred_tea = batch_dict['decoded_pred_tea'][b_idx]
+                pred_scores = cur_pred_tea['pred_scores']
+                score_mask = pred_scores > self.model_cfg.FEATURE_KD.ROI_POOL.THRESH
+                rois.append(cur_pred_tea['pred_boxes'][score_mask])
+                weis.append(pred_scores[score_mask]+1/(pred_scores[score_mask]+2))
+            weis = torch.cat(weis)
+            pred_dict_stu = self.dense_head.forward_ret_dict['decoded_pred_dicts']
+            rois_stu = [pred_dict_stu[i]['pred_boxes'] for i in range(bs)]
+            # import pdb; pdb.set_trace()
+            weis_stu = [pred_dict_stu[i]['pred_boxes'] for i in range(bs)]
+        else:
+            raise NotImplementedError
+
+        if feature_stu.shape[2] == feat_height_tea:
+            voxel_size_stu = self.voxel_size_tea
+            feature_map_stride_stu = self.feature_map_stride_tea
+        elif feature_stu.shape[2] == feat_height:
+            voxel_size_stu = self.voxel_size
+            feature_map_stride_stu = self.feature_map_stride
+        else:
+            raise NotImplementedError
+
+        if feature_tea.shape[2] == feat_height_tea:
+            voxel_size_tea = self.voxel_size_tea
+            feature_map_stride_tea = self.feature_map_stride_tea
+        elif feature_tea.shape[2] == feat_height:
+            voxel_size_tea = self.voxel_size
+            feature_map_stride_tea = self.feature_map_stride
+        else:
+            raise NotImplementedError
+
+        num_rois = 0
+        for roi in rois:
+            num_rois += roi.shape[0]
+
+        if num_rois == 0:
+            kd_feature_loss = 0.0
+        else:
+            roi_feats = self.roi_pool_func(
+                feature_stu, rois, voxel_size_stu, feature_map_stride_stu
+            )
+            roi_feats_tea = self.roi_pool_func(
+                feature_tea, rois, voxel_size_tea, feature_map_stride_tea
+            )
+
+            # # # -----  align_channel ----------
+            # roi_feats_tea = roi_feats_tea.transpose(3, 1)
+            # f_s = (roi_feats.size(2), roi_feats.size(1))  # h,c
+            # roi_feats_tea = torch.nn.functional.interpolate(roi_feats_tea, size=f_s, mode='bilinear')
+            # roi_feats_tea = roi_feats_tea.transpose(3, 1)
+            # kd_feature_loss = loss_cfg.weight * self.kd_feature_loss_func(roi_feats, roi_feats_tea).mean()
+            kd_feature_loss=0
+            if loss_cfg.get('GID', None):
+                cnt = 0
+                kd_feat_rel_loss = 0
+                for b_roi in rois:
+                    num_roi = (b_roi[:, 3] != 0).sum()
+                    cur_roi_feats = roi_feats[cnt:cnt + num_roi].view(num_roi, -1)
+                    cur_roi_feats_tea = roi_feats_tea[cnt:cnt+num_roi].view(num_roi, -1)
+
+                    rel_tea = common_utils.pair_distance_gpu(cur_roi_feats_tea, cur_roi_feats_tea)
+                    rel_tea /= rel_tea.mean()
+                    rel_stu = common_utils.pair_distance_gpu(cur_roi_feats, cur_roi_feats)
+                    rel_stu /= rel_stu.mean()
+
+                    kd_feat_rel_loss += torch.nn.functional.smooth_l1_loss(rel_tea, rel_stu)
+                    cnt += num_roi
+
+                kd_feature_loss += loss_cfg.GID.rel_weight * kd_feat_rel_loss / bs
+            if loss_cfg.get('GID_ANG', None):
+                cnt = 0
+                kd_feat_ang_loss = 0
+                #import pdb; pdb.set_trace()
+                # -----------------------------------------------------------------------------
+                for b_roi in rois:
+                    num_roi = (b_roi[:, 3] != 0).sum()
+                    cur_roi_feats = roi_feats[cnt:cnt + num_roi].contiguous().view(num_roi, -1)
+                    cur_roi_feats_tea = roi_feats_tea[cnt:cnt + num_roi].contiguous().view(num_roi, -1)
+
+                    ang_tea = common_utils.pair_angle_gpu(cur_roi_feats_tea)
+                    ang_stu = common_utils.pair_angle_gpu(cur_roi_feats)
+
+                    if self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea':
+                        loss_ang = torch.nn.functional.smooth_l1_loss(ang_tea, ang_stu, reduction='none')
+                        loss_ang = loss_ang.sum(dim=1)
+                        kd_feat_ang_loss += torch.dot(loss_ang, weis[cnt:cnt + num_roi])/num_roi
+                    else:
+                        kd_feat_ang_loss += torch.nn.functional.smooth_l1_loss(ang_tea, ang_stu)
+                    cnt += num_roi
+                kd_feature_loss += loss_cfg.ang_weight * kd_feat_ang_loss /bs
+
+        return kd_feature_loss
+
+    def get_feature_kd_loss_rois2(self, batch_dict, loss_cfg):
+        feature_name = self.model_cfg.FEATURE_KD.FEATURE_NAME  # spatial_features_2d
+        feature_stu = batch_dict[feature_name]
+        feature_name_tea = self.model_cfg.FEATURE_KD.get('FEATURE_NAME_TEA', feature_name)  # spatial_features_2d
+        # --------TEA_2--------------
+        # if loss_cfg.get('tea_num', None):
+        #     feature_tea = batch_dict[feature_name_tea + '_tea2']  # spatial_features_2d_tea2
+        feature_tea = batch_dict[feature_name_tea + '_tea2']
+
+        feat_height = feature_stu.shape[2]
+        feat_height_tea = feature_tea.shape[2]
+
+        bs = feature_stu.shape[0]
+        if self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'gt':
+            rois = batch_dict['gt_boxes'].detach()
+        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea':
+            rois = []
+            # --------TEA_2--------------
+            if loss_cfg.get('tea_new', None):
+                for b_idx in range(bs):
+                    cur_pred_tea = batch_dict['decoded_pred_tea2'][b_idx]
+                    pred_scores = cur_pred_tea['pred_scores']
+                    score_mask = pred_scores > self.model_cfg.FEATURE_KD.ROI_POOL.THRESH
+                    rois.append(cur_pred_tea['pred_boxes'][score_mask])
+            else:
+                for b_idx in range(bs):
+                    cur_pred_tea = batch_dict['decoded_pred_tea'][b_idx]
+                    pred_scores = cur_pred_tea['pred_scores']
+                    score_mask = pred_scores > self.model_cfg.FEATURE_KD.ROI_POOL.THRESH
+                    rois.append(cur_pred_tea['pred_boxes'][score_mask])
+        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'stu':
+            pred_dict_stu = self.dense_head.forward_ret_dict['decoded_pred_dicts']
+            rois = [pred_dict_stu[i]['pred_boxes'] for i in range(bs)]
+        else:
+            raise NotImplementedError
+
+        if feature_stu.shape[2] == feat_height_tea:
+            voxel_size_stu = self.voxel_size_tea
+            feature_map_stride_stu = self.feature_map_stride_tea
+        elif feature_stu.shape[2] == feat_height:
+            voxel_size_stu = self.voxel_size
+            feature_map_stride_stu = self.feature_map_stride
+        else:
+            raise NotImplementedError
+
+        if feature_tea.shape[2] == feat_height_tea:
+            voxel_size_tea = self.voxel_size_tea
+            feature_map_stride_tea = self.feature_map_stride_tea
+        elif feature_tea.shape[2] == feat_height:
+            voxel_size_tea = self.voxel_size
+            feature_map_stride_tea = self.feature_map_stride
+        else:
+            raise NotImplementedError
+
+        num_rois = 0
+        for roi in rois:
+            num_rois += roi.shape[0]
+        if num_rois == 0:
+            kd_feature_loss = 0.0
+        else:
+            roi_feats = self.roi_pool_func(
+                feature_stu, rois, voxel_size_stu, feature_map_stride_stu
+            )
+            roi_feats_tea = self.roi_pool_func(
+                feature_tea, rois, voxel_size_tea, feature_map_stride_tea
+            )
+            # ============alian channel xiugai ==================================
+            roi_feats = roi_feats.transpose(3, 1)
+            f_s = (roi_feats_tea.size(2), roi_feats_tea.size(1))
+            roi_feats = torch.nn.functional.interpolate(roi_feats, size=f_s, mode='bilinear')
+            roi_feats = roi_feats.transpose(3, 1)
+            # ----------------------------------------------------------------
+            kd_feature_loss = loss_cfg.weight * self.kd_feature_loss_func(roi_feats, roi_feats_tea).mean()
+
+            if loss_cfg.get('GID', None):
+                cnt = 0
+                kd_feat_rel_loss = 0
+                for b_roi in rois:
+                    num_roi = (b_roi[:, 3] != 0).sum()
+                    cur_roi_feats = roi_feats[cnt:cnt + num_roi].view(num_roi, -1)
+                    cur_roi_feats_tea = roi_feats_tea[cnt:cnt + num_roi].view(num_roi, -1)
+
+                    rel_tea = common_utils.pair_distance_gpu(cur_roi_feats_tea, cur_roi_feats_tea)
+                    rel_tea /= rel_tea.mean()
+                    rel_stu = common_utils.pair_distance_gpu(cur_roi_feats, cur_roi_feats)
+                    rel_stu /= rel_stu.mean()
+
+                    kd_feat_rel_loss += torch.nn.functional.smooth_l1_loss(rel_tea, rel_stu)
+                    cnt += num_roi
+
+                kd_feature_loss += loss_cfg.GID.rel_weight * kd_feat_rel_loss / bs
+
+            if loss_cfg.get('GID_ANG', None):
+                kd_feature_loss = 0.0
+                cnt = 0
+                kd_feat_ang_loss = 0
+                #import pdb; pdb.set_trace()
+                # -----------------------------------------------------------------------------
+                for b_roi in rois:
+                    num_roi = (b_roi[:, 3] != 0).sum()
+                    if num_roi == 0:
+                        continue
+                    cur_roi_feats = roi_feats[cnt:cnt + num_roi].contiguous().view(num_roi, -1)
+                    cur_roi_feats_tea = roi_feats_tea[cnt:cnt + num_roi].view(num_roi, -1)
+
+                    ang_tea = common_utils.pair_angle_gpu(cur_roi_feats_tea)
+                    ang_stu = common_utils.pair_angle_gpu(cur_roi_feats)
+
+
+                    if self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea':
+                        loss_ang = torch.nn.functional.smooth_l1_loss(ang_tea, ang_stu, reduction='none').sum(dim=1)
+                        kd_feat_ang_loss += torch.dot(loss_ang, weis[cnt:cnt + num_roi]) / num_roi
+                    else:
+                        kd_feat_ang_loss += torch.nn.functional.smooth_l1_loss(ang_tea, ang_stu)
+                    cnt += num_roi
+                kd_feature_loss += loss_cfg.ang_weight * kd_feat_ang_loss / bs
+
+        return kd_feature_loss
+
+    def get_normalized_weights(self, adaptive_weights, temperature=2.0, adaptive_mask=None):
+        tensor_weights = torch.tensor(adaptive_weights, dtype=torch.float32)
+        if adaptive_mask is None:
+            adaptive_mask= torch.ones_like(tensor_weights)
+        tensor_weights = tensor_weights*adaptive_mask
+        softmax_weights = torch.nn.functional.softmax(-tensor_weights / temperature, dim=0)  #行方向(dim=0)
+        return softmax_weights
+    def get_confidence_weights(self, adaptive_weights, temperature=2.0, adaptive_mask=None):
+        tensor_weights = torch.tensor(adaptive_weights, dtype=torch.float32)
+        if adaptive_mask is None:
+            adaptive_mask = torch.ones_like(tensor_weights)
+        tensor_weights = tensor_weights * adaptive_mask
+        sum_weights = torch.exp(tensor_weights).sum()
+        softmax_weights = (1 - torch.exp(tensor_weights) / sum_weights) / tensor_weights.shape[0]
+        return softmax_weights
+    def create_softmax_mask(self, adaptive_weights, max_thred=5.0, min_thred=0.1):
+        tensor_weights = torch.tensor(adaptive_weights, dtype=torch.float32)
+        max_val = torch.max(tensor_weights)
+        min_val = torch.min(tensor_weights)
+        if min_val <= min_thred:
+            # Create mask where values < 0.1 are 1, others are 0
+            mask = (tensor_weights <= min_thred).float()
+        if max_val >= max_thred:
+            # Create mask where values > 10 are 0, others are 1
+            mask = (tensor_weights <= max_thred).float()
+        else:
+            # If neither condition is met, return all ones
+            mask = torch.ones_like(tensor_weights)
+        return mask
+        
+    def _apply_teacher_alignment(self, features_tea):
+        if hasattr(self.dense_head, 'teacher_align_layer'):
+            aligned = []
+            for feat, align_layer in zip(features_tea, self.dense_head.teacher_align_layer):
+                feat256, feat32 = align_layer(feat)
+                aligned.append((feat256, feat32))
+            return aligned  # len=5, each=(256,32)
+    def _apply_student_multi_scale_alignment(self, feature_stu):
+        if hasattr(self.dense_head, 'student_align_layer'):
+            feat256, feat32 = self.dense_head.student_align_layer(feature_stu)
+            return [(feat256, feat32)] * 5  # student 是共享的，不是 5 套独立参数
+
+    def get_feature_kd_loss_rois5(self, batch_dict, loss_cfg):
         feature_name = self.model_cfg.FEATURE_KD.FEATURE_NAME  # spatial_features_2d
         feature_stu = batch_dict[feature_name]
         feature_name_tea = self.model_cfg.FEATURE_KD.get('FEATURE_NAME_TEA', feature_name)  # spatial_features_2d
@@ -161,32 +488,24 @@ class CenterFeatureKDHead(KDHeadTemplate):
             batch_dict[feature_name_tea + '_tea3'],  # teacher 3
             batch_dict[feature_name_tea + '_tea4'],  # teacher 4
             batch_dict[feature_name_tea + '_tea5']  # teacher 5
-        ]  #[4, 512, 188, 188]
+        ] 
         feat_height = feature_stu.shape[2]
-        feat_height_tea = features_tea[0].shape[2]  # 使用第一个teacher的特征图高度作为参考
+        feat_height_tea = features_tea[0].shape[2] 
         bs = feature_stu.shape[0]
         if self.model_cfg.FEATURE_KD.get('Channel_Align_Layer', None):
             # 检查是否有对齐层
             has_teacher_align = hasattr(self.dense_head, 'teacher_align_layer')
             has_student_align = hasattr(self.dense_head, 'student_align_layer')
             if has_teacher_align and has_student_align:
-                # feature_stu = self._apply_student_alignment(feature_stu)
-                # 对齐教师特征 (生成5个对齐后的特征)
                 features_tea = self._apply_teacher_alignment(features_tea)
-                # 对齐学生特征 (生成5个不同尺度的特征)
                 features_stu = self._apply_student_multi_scale_alignment(feature_stu)
             else:
-                # features_tea = features_tea_
                 print(f"[Warning] Align layers not fully registered: "
                       f"teacher={has_teacher_align}, student={has_student_align}")
-                # 如果没有对齐层，返回零损失（仍然保持梯度图）
                 return {
                     'feat_kd_loss_total': torch.tensor(0.0, device=feature_stu.device,
                                                        requires_grad=True)
                 }
-
-
-
 
         # ROI selection
         if self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'gt':
@@ -247,7 +566,6 @@ class CenterFeatureKDHead(KDHeadTemplate):
                     rois.append(torch.zeros((0, 7)).to(feature_stu.device))
         elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea_5' and batch_dict['temperature'] == 0.0:
             rois = []
-            # 使用第 teacher_idx个teacher的预测框
             normalized_weights = self.get_normalized_weights(batch_dict['adaptive_weights'], temperature=200)
             teacher_idx = normalized_weights.argmax()
             for b_idx in range(bs):
@@ -257,7 +575,6 @@ class CenterFeatureKDHead(KDHeadTemplate):
                 rois.append(cur_pred_tea['pred_boxes'][score_mask])
         elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea':
             rois = []
-            # 使用第 teacher_idx个teacher的预测框
             teacher_idx = 0  #0,1,2,3,4 visual
             for b_idx in range(bs):
                 cur_pred_tea = batch_dict[f'decoded_pred_tea{teacher_idx + 1 if teacher_idx > 0 else ""}'][b_idx]
@@ -297,7 +614,6 @@ class CenterFeatureKDHead(KDHeadTemplate):
         if num_rois == 0:
             kd_feature_loss = 0.0
         else:
-            # roi_feats_tea_multi = []  # roi [256, 512, 7, 7]
             roi_feats_tea_256, roi_feats_tea_32 = [], []
             roi_feats_stu_256, roi_feats_stu_32 = [], []
 
@@ -320,34 +636,26 @@ class CenterFeatureKDHead(KDHeadTemplate):
             assert len(roi_feats_tea_256) == len(batch_dict['adaptive_weights'])
             normalized_weights = self.get_normalized_weights(batch_dict['adaptive_weights'], temperature=200)
             if batch_dict['temperature'] == 0:
-                max_index = normalized_weights.argmax()  # 找到最da值的索引
+                max_index = normalized_weights.argmax()  # 找到索引
                 normalized_weights = torch.zeros_like(normalized_weights)
                 normalized_weights[max_index] = 1  # 将找到的位置设置为1
             else:
                 normalized_weights = self.get_normalized_weights(batch_dict['adaptive_weights'],
                                                                  temperature=batch_dict['temperature'])
 
-            # import pdb;
-            # pdb.set_trace()
-            # print('adaptive_roi_weights', adaptive_roi_weights) import pdb;pdb.set_trace()
-            # ----------------------------------------------------------------
-            # roi_feats_tea_avg = roi_feats_tea_multi.mean(dim=0)  # multi--->single
-            # kd_feature_loss = loss_cfg.weight * self.kd_feature_loss_func(roi_feats, roi_feats_tea_avg).mean()
             kd_feature_loss = loss_cfg.weight * sum([normalw * self.kd_feature_loss_func(roi_feat_stu, roi_feat_tea).mean()
                                for normalw, roi_feat_stu, roi_feat_tea in zip(normalized_weights, roi_feats_stu_256, roi_feats_tea_256)])
-            # kd_feature_loss = 0
 
             for tea_idx in range(len(roi_feats_tea_32)):
                 roi_feats_tea = roi_feats_tea_32[tea_idx]  # [5* (400, 384, 7, 7)]
                 roi_feats = roi_feats_stu_32[tea_idx]
 
-                if loss_cfg.get('GID_ANG', None):  # 如果启用GID损失
+                if loss_cfg.get('GID_ANG', None): 
                     # kd_feature_loss = 0.0
                     cnt = 0
                     # ------------------23/05/29/ 这里改成ang 加上 featur loss  --------
                     kd_feat_ang_loss = 0
                     # import pdb; pdb.set_trace()
-                    # -----------------------------------------------------------------------------
                     for b_roi in rois:
                         num_roi = (b_roi[:, 3] != 0).sum()  # 当前图片有效ROI数量
                         if num_roi == 0:
@@ -361,225 +669,10 @@ class CenterFeatureKDHead(KDHeadTemplate):
                         ang_stu = common_utils.pair_angle_gpu_sampled(cur_roi_feats)
                         kd_feat_ang_loss += torch.nn.functional.smooth_l1_loss(ang_tea, ang_stu)
                         cnt += num_roi
-                    # kd_feature_loss += loss_cfg.ang_weight * kd_feat_ang_loss / bs
                     kd_feature_loss += normalized_weights[tea_idx] * (loss_cfg.ang_weight * kd_feat_ang_loss / bs)
 
-
         return kd_feature_loss
-
-    def get_normalized_weights(self, adaptive_weights, temperature=2.0, adaptive_mask=None):
-        tensor_weights = torch.tensor(adaptive_weights, dtype=torch.float32)
-        if adaptive_mask is None:
-            adaptive_mask= torch.ones_like(tensor_weights)
-        tensor_weights = tensor_weights*adaptive_mask
-        softmax_weights = torch.nn.functional.softmax(-tensor_weights / temperature, dim=0)  #行方向(dim=0)
-        return softmax_weights
-    def get_confidence_weights(self, adaptive_weights, temperature=2.0, adaptive_mask=None):
-        tensor_weights = torch.tensor(adaptive_weights, dtype=torch.float32)
-        if adaptive_mask is None:
-            adaptive_mask = torch.ones_like(tensor_weights)
-        tensor_weights = tensor_weights * adaptive_mask
-        sum_weights = torch.exp(tensor_weights).sum()
-        softmax_weights = (1 - torch.exp(tensor_weights) / sum_weights) / tensor_weights.shape[0]
-        return softmax_weights
-    def create_softmax_mask(self, adaptive_weights, max_thred=5.0, min_thred=0.1):
-        tensor_weights = torch.tensor(adaptive_weights, dtype=torch.float32)
-        max_val = torch.max(tensor_weights)
-        min_val = torch.min(tensor_weights)
-        if min_val <= min_thred:
-            # Create mask where values < 0.1 are 1, others are 0
-            mask = (tensor_weights <= min_thred).float()
-        if max_val >= max_thred:
-            # Create mask where values > 10 are 0, others are 1
-            mask = (tensor_weights <= max_thred).float()
-        else:
-            # If neither condition is met, return all ones
-            mask = torch.ones_like(tensor_weights)
-        return mask
-    def get_feature_kd_loss_rois3(self, batch_dict, loss_cfg):
-        feature_name = self.model_cfg.FEATURE_KD.FEATURE_NAME  # spatial_features_2d
-        feature_stu = batch_dict[feature_name]
-        feature_name_tea = self.model_cfg.FEATURE_KD.get('FEATURE_NAME_TEA', feature_name)  # spatial_features_2d
-
-        features_tea = [
-            batch_dict[feature_name_tea + '_tea'],  # teacher 1
-            batch_dict[feature_name_tea + '_tea2'],  # teacher 2
-            batch_dict[feature_name_tea + '_tea3'],  # teacher 3
-            batch_dict[feature_name_tea + '_tea4'],  # teacher 4
-            batch_dict[feature_name_tea + '_tea5']  # teacher 5
-        ]  #[4, 512, 188, 188]
-
-        feat_height = feature_stu.shape[2]
-        feat_height_tea = features_tea[0].shape[2]
-        bs = feature_stu.shape[0]
-
-        if self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'gt':
-            rois = batch_dict['gt_boxes'].detach()
-        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'select':
-            normalized_weights = self.get_normalized_weights(batch_dict['adaptive_weights'], temperature=200)
-            min_index = normalized_weights.argmin()
-            rois = []
-            teacher_idx = min_index
-            for b_idx in range(bs):
-                cur_pred_tea = batch_dict[f'decoded_pred_tea{teacher_idx + 1 if teacher_idx > 0 else ""}'][b_idx]
-                pred_scores = cur_pred_tea['pred_scores']
-                score_mask = pred_scores > self.model_cfg.FEATURE_KD.ROI_POOL.THRESH
-                rois.append(cur_pred_tea['pred_boxes'][score_mask])
-
-        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea_5' and batch_dict['temperature'] == 200:
-            rois = []
-            for b_idx in range(bs):
-                pred_boxes_list = []
-                pred_scores_list = []
-                for teacher_idx in range(5):
-                    cur_pred_tea = batch_dict[f'decoded_pred_tea{teacher_idx + 1 if teacher_idx > 0 else ""}'][b_idx]
-                    pred_scores = cur_pred_tea['pred_scores']
-                    score_mask = pred_scores > self.model_cfg.FEATURE_KD.ROI_POOL.THRESH
-                    pred_boxes_list.append(cur_pred_tea['pred_boxes'][score_mask])
-                    pred_scores_list.append(pred_scores[score_mask])
-
-                if len(pred_boxes_list) > 0:
-                    all_boxes = torch.cat(pred_boxes_list, dim=0)
-                    all_scores = torch.cat(pred_scores_list, dim=0)
-
-                    from ....ops.iou3d_nms import iou3d_nms_utils
-                    iou_matrix = iou3d_nms_utils.boxes_iou3d_gpu(all_boxes[:, :7], all_boxes[:, :7])
-                    nms_thresh = self.model_cfg.FEATURE_KD.ROI_POOL.get('NMS_THRESH', 0.1)
-
-                    scores_sorted, indices = torch.sort(all_scores, descending=True)
-                    boxes_sorted = all_boxes[indices]
-
-                    keep_indices = []
-                    while indices.numel() > 0:
-                        keep_indices.append(indices[0])
-                        if indices.numel() == 1:
-                            break
-
-                        cur_ious = iou_matrix[indices[0], indices[1:]]
-                        mask = cur_ious < nms_thresh
-                        indices = indices[1:][mask]
-
-                    keep_indices = torch.stack(keep_indices)
-                    nms_boxes = all_boxes[keep_indices]
-
-                    max_rois = self.model_cfg.FEATURE_KD.ROI_POOL.get('MAX_ROIS', 100)
-                    if len(nms_boxes) > max_rois:
-                        nms_boxes = nms_boxes[:max_rois]
-
-                    rois.append(nms_boxes)
-                else:
-                    rois.append(torch.zeros((0, 7)).to(feature_stu.device))
-        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea_5' and batch_dict['temperature'] == 0.02:
-            rois = []
-            normalized_weights = self.get_normalized_weights(batch_dict['adaptive_weights'], temperature=200)
-            teacher_idx = normalized_weights.argmin()
-            for b_idx in range(bs):
-                cur_pred_tea = batch_dict[f'decoded_pred_tea{teacher_idx + 1 if teacher_idx > 0 else ""}'][b_idx]
-                pred_scores = cur_pred_tea['pred_scores']
-                score_mask = pred_scores > self.model_cfg.FEATURE_KD.ROI_POOL.THRESH
-                rois.append(cur_pred_tea['pred_boxes'][score_mask])
-        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'tea':
-            rois = []
-            teacher_idx = 0
-            for b_idx in range(bs):
-                cur_pred_tea = batch_dict[f'decoded_pred_tea{teacher_idx + 1 if teacher_idx > 0 else ""}'][b_idx]
-                pred_scores = cur_pred_tea['pred_scores']
-                score_mask = pred_scores > self.model_cfg.FEATURE_KD.ROI_POOL.THRESH
-                rois.append(cur_pred_tea['pred_boxes'][score_mask])
-        elif self.model_cfg.FEATURE_KD.ROI_POOL.ROI == 'stu':
-            pred_dict_stu = self.dense_head.forward_ret_dict['decoded_pred_dicts']
-            rois = [pred_dict_stu[i]['pred_boxes'] for i in range(bs)]
-        else:
-            raise NotImplementedError
-
-        if feature_stu.shape[2] == feat_height_tea:
-            voxel_size_stu = self.voxel_size_tea
-            feature_map_stride_stu = self.feature_map_stride_tea
-        elif feature_stu.shape[2] == feat_height:
-            voxel_size_stu = self.voxel_size
-            feature_map_stride_stu = self.feature_map_stride
-        else:
-            raise NotImplementedError
-
-        if features_tea[0].shape[2] == feat_height_tea:
-            voxel_size_tea = self.voxel_size_tea
-            feature_map_stride_tea = self.feature_map_stride_tea
-        elif features_tea[0].shape[2] == feat_height:
-            voxel_size_tea = self.voxel_size
-            feature_map_stride_tea = self.feature_map_stride
-        else:
-            raise NotImplementedError
-
-        num_rois = 0
-        for roi in rois:
-            num_rois += roi.shape[0]
-        if num_rois == 0:
-            kd_feature_loss = 0.0
-        else:
-            roi_feats = self.roi_pool_func(
-                feature_stu, rois, voxel_size_stu, feature_map_stride_stu
-            )
-
-            roi_feats_tea1 = self.roi_pool_func(features_tea[0], rois, voxel_size_tea, feature_map_stride_tea)
-
-            f_s = (roi_feats_tea1.size(2), roi_feats_tea1.size(1))
-            if roi_feats_tea1.shape != roi_feats.shape:
-                roi_feats = roi_feats.transpose(3, 1)
-                roi_feats = torch.nn.functional.interpolate(roi_feats, size=f_s, mode='bilinear')
-                roi_feats = roi_feats.transpose(3, 1).contiguous()
-
-            roi_feats_tea_multi = []  # roi [256, 512, 7, 7]
-            for jdx in range(len(features_tea)):  # jdx==tea_num 1,2,3,4
-                if jdx == 0:
-                    roi_feats_tea = roi_feats_tea1
-                else:
-                    roi_feats_tea = self.roi_pool_func(features_tea[jdx], rois, voxel_size_tea, feature_map_stride_tea)
-                    if f_s != (roi_feats_tea.size(2), roi_feats_tea.size(1)):
-                        roi_feats_tea = roi_feats_tea.transpose(3, 1)
-                        roi_feats_tea = torch.nn.functional.interpolate(roi_feats_tea, size=f_s, mode='bilinear')
-                        roi_feats_tea = roi_feats_tea.transpose(3, 1).contiguous()
-                roi_feats_tea_multi.append(roi_feats_tea)
-
-            assert len(roi_feats_tea_multi) == len(batch_dict['adaptive_weights'])
-            normalized_weights = self.get_normalized_weights(batch_dict['adaptive_weights'], temperature=200)
-            if batch_dict['temperature'] == 0.0:
-                normalized_weights = torch.zeros_like(normalized_weights)
-                normalized_weights[0] = 1
-            elif batch_dict['temperature'] == 0.02:
-                min_index = normalized_weights.argmin()
-                normalized_weights = torch.zeros_like(normalized_weights)
-                normalized_weights[min_index] = 1
-            else:
-                normalized_weights = self.get_normalized_weights(batch_dict['adaptive_weights'],
-                                                                 temperature=batch_dict['temperature'])
-            kd_feature_loss = 0
-
-            for tea_idx in range(len(roi_feats_tea_multi)):
-                roi_feats_tea = roi_feats_tea_multi[tea_idx]  # [5* (400, 384, 7, 7)]
-                if abs(normalized_weights[tea_idx] - 0) < 1e-6:
-                    continue
-
-                if loss_cfg.get('GID_ANG', None):
-                    cnt = 0
-                    kd_feat_ang_loss = 0
-                    for b_roi in rois:
-                        num_roi = (b_roi[:, 3] != 0).sum()
-                        if num_roi == 0:
-                            continue
-                        cur_roi_feats = roi_feats[cnt:cnt + num_roi].contiguous().view(num_roi, -1)
-                        cur_roi_feats_tea = roi_feats_tea[cnt:cnt + num_roi].contiguous().view(num_roi, -1)
-
-                        ang_tea = common_utils.pair_angle_gpu(cur_roi_feats_tea)
-                        ang_stu = common_utils.pair_angle_gpu(cur_roi_feats)
-
-                        kd_feat_ang_loss += torch.nn.functional.smooth_l1_loss(ang_tea, ang_stu)
-                        cnt += num_roi
-
-                    kd_feature_loss += normalized_weights[tea_idx] * loss_cfg.ang_weight * kd_feat_ang_loss / bs
-
-
-        return kd_feature_loss
-
+        
     def get_feature_kd_loss_spatial(self, batch_dict, loss_cfg):
         feature_name = self.model_cfg.FEATURE_KD.FEATURE_NAME
         feature_stu = batch_dict[feature_name]

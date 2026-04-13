@@ -36,7 +36,7 @@ class TeacherAlignLayer(nn.Module):
                 start = int(i*step)
                 end = int((i+1)*step)
                 k = max(end-start, 1)
-                conv.weight[i,start:end,0,0] = 1.0/k
+                conv.weight[i,start:end,:,:] = 1.0/k
     def channel_dowmsample(self,x):
         B,C,H,W = x.shape
         step = C// self.out_c1
@@ -67,8 +67,10 @@ class StudentAlignLayer(nn.Module):
             out_c, in_c, _, _ =conv.weight.shape
             step = in_c /out_c
             for i in range(out_c):
-                j = int(i*step)
-                conv.weight[i,j,0,0] = 1.0
+                start = int(i*step)
+                end = int((i+1)*step)
+                k = max(end-start, 1)
+                conv.weight[i,start:end,:,:] = 1.0/k
 
     def forward(self, feat):
         feat256 = feat

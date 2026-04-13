@@ -12,17 +12,13 @@ class TeacherAlignLayer(nn.Module):
         self.out_c2 = out_c2
         self.conv256 = nn.Conv2d(in_channels, out_c1, kernel_size=1, bias=False)
         self.bn256 = nn.BatchNorm2d(out_c1)
-        self.conv32 = nn.Sequential(
-            nn.Conv2d(out_c1, out_c2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_c2),
-            nn.ReLU(inplace=True)
-        )
+        self.conv32 = nn.Conv2d(out_c1, out_c2, kernel_size=3, padding=1, bias=False)
         self.bn32 = nn.BatchNorm2d(out_c2)
         self.relu = nn.ReLU(inplace=True)
 
-        self._init_weights()
-        # self.channel_select_init(self.conv32)
-        # self.channel_select_init(self.conv256)
+        # self._init_weights()
+        self.channel_select_init(self.conv32)
+        self.channel_select_init(self.conv256)
 
     def _init_weights(self):
         nn.init.orthogonal_(self.conv256.weight)
@@ -56,8 +52,8 @@ class StudentAlignLayer(nn.Module):
         self.bn32 = nn.BatchNorm2d(out_channel)
         self.relu = nn.ReLU(inplace=True)
 
-        self._init_weights()
-        # self.channel_select_init(self.conv32)
+        # self._init_weights()
+        self.channel_select_init(self.conv32)
 
     def _init_weights(self):
         nn.init.orthogonal_(self.conv32.weight)

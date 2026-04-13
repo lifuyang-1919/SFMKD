@@ -26,13 +26,14 @@ class TeacherAlignLayer(nn.Module):
     def channel_select_init(self,conv):
         with torch.no_grad():
             conv.weight.zero_()
-            out_c, in_c, _, _ =conv.weight.shape
+            out_c, in_c, kH, kW =conv.weight.shape
+            cH, cW = kH // 2, kW // 2
             step = in_c /out_c
             for i in range(out_c):
                 start = int(i*step)
                 end = int((i+1)*step)
                 k = max(end-start, 1)
-                conv.weight[i,start:end,:,:] = 1.0/k
+                conv.weight[i,start:end, cH, cW] = 1.0/k
     def channel_dowmsample(self,x):
         B,C,H,W = x.shape
         step = C// self.out_c1
@@ -60,13 +61,14 @@ class StudentAlignLayer(nn.Module):
     def channel_select_init(self,conv):
         with torch.no_grad():
             conv.weight.zero_()
-            out_c, in_c, _, _ =conv.weight.shape
+            out_c, in_c, kH, kW =conv.weight.shape
+            cH, cW = kH // 2, kW // 2
             step = in_c /out_c
             for i in range(out_c):
                 start = int(i*step)
                 end = int((i+1)*step)
                 k = max(end-start, 1)
-                conv.weight[i,start:end,:,:] = 1.0/k
+                conv.weight[i,start:end, cH, cW] = 1.0/k
 
     def forward(self, feat):
         feat256 = feat

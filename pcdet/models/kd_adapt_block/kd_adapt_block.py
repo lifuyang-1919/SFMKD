@@ -10,11 +10,7 @@ class TeacherAlignLayer(nn.Module):
         super().__init__()
         self.out_c1=out_c1
         self.out_c2 = out_c2
-        self.conv256 = nn.Sequential(
-            nn.Conv2d(in_channels, out_c1, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c1),
-            nn.ReLU(inplace=True)
-        )
+        self.conv256 = nn.Conv2d(in_channels, out_c1, kernel_size=1, bias=False)
         self.bn256 = nn.BatchNorm2d(out_c1)
         self.conv32 = nn.Sequential(
             nn.Conv2d(out_c1, out_c2, kernel_size=3, padding=1, bias=False),
@@ -24,13 +20,13 @@ class TeacherAlignLayer(nn.Module):
         self.bn32 = nn.BatchNorm2d(out_c2)
         self.relu = nn.ReLU(inplace=True)
 
-        # self._init_weights()
-        self.channel_select_init(self.conv32)
-        self.channel_select_init(self.conv256)
+        self._init_weights()
+        # self.channel_select_init(self.conv32)
+        # self.channel_select_init(self.conv256)
 
-    # def _init_weights(self):
-    #     nn.init.orthogonal_(self.conv256.weight)
-    #     nn.init.orthogonal_(self.conv32.weight)
+    def _init_weights(self):
+        nn.init.orthogonal_(self.conv256.weight)
+        nn.init.orthogonal_(self.conv32.weight)
     def channel_select_init(self,conv):
         with torch.no_grad():
             conv.weight.zero_()
@@ -56,19 +52,15 @@ class TeacherAlignLayer(nn.Module):
 class StudentAlignLayer(nn.Module):
     def __init__(self, in_channel=256, out_channel=32):
         super().__init__()
-        self.conv32 = nn.Sequential(
-            nn.Conv2d(in_channel, out_channel, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channel),
-            nn.ReLU(inplace=True)
-        )
+        self.conv32 = nn.Conv2d(in_channel, out_channel, kernel_size=3, padding=1, bias=False)
         self.bn32 = nn.BatchNorm2d(out_channel)
         self.relu = nn.ReLU(inplace=True)
 
-        # self._init_weights()
-        self.channel_select_init(self.conv32)
+        self._init_weights()
+        # self.channel_select_init(self.conv32)
 
-    # def _init_weights(self):
-    #     nn.init.orthogonal_(self.conv32.weight)
+    def _init_weights(self):
+        nn.init.orthogonal_(self.conv32.weight)
     def channel_select_init(self,conv):
         with torch.no_grad():
             conv.weight.zero_()
